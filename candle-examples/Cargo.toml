@@ -92,6 +92,7 @@ metal = [
     "candle-nn/metal",
     "candle-transformers/metal",
 ]
+metal-debug-labels = ["metal", "candle/metal-debug-labels", "candle-nn/metal-debug-labels", "candle-transformers/metal-debug-labels"]
 rocm = [
     "candle/rocm",
     "candle-nn/rocm",
