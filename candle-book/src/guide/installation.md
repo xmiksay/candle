@@ -51,6 +51,27 @@ at build time, and the CUDA `tileiras` compiler at runtime. Set `CUDA_TOOLKIT_PA
 root when it is not installed in a standard location. See [Writing cuTile kernels](cutile.md) for
 the API and CUDA architecture requirements.
 
+### ROCm
+
+ROCm is the AMD GPU backend. Make sure ROCm 6.2 or newer is installed and on
+`PATH`:
+- `hipcc --version` should print information about your HIP compiler driver.
+- `rocminfo | grep gfx` should print your GPU architecture, e.g. `gfx1101`.
+
+Unlike CUDA, the kernels are not compiled during `cargo build`: `hipcc` compiles
+them on first use and caches the result under `~/.cache/candle-rocm`, so the
+same binary runs on any architecture. Set `CANDLE_ROCM_ARCH=<arch>` if
+auto-detection is unavailable or picks the wrong GPU.
+
+Add the `candle-core` crate with the rocm feature:
+
+```bash
+cargo add --git https://github.com/huggingface/candle.git candle-core --features "rocm"
+```
+
+If MIOpen is installed, `--features "miopen"` runs convolutions through it
+instead of the default im2col plus rocBLAS GEMM.
+
 ### MKL
 
 You can also see the `mkl` feature which can get faster inference on CPU.
