@@ -51,6 +51,8 @@ mod tests_copy;
 #[cfg(test)]
 mod tests_custom_kernel;
 #[cfg(test)]
+mod tests_device;
+#[cfg(test)]
 mod tests_f8e4m3;
 #[cfg(test)]
 mod tests_gemm;
@@ -74,6 +76,7 @@ pub use launch::{
 };
 pub use params::{params_from_vec, ParamBuffer};
 pub use slice::RocmStorageSlice;
+pub use wrappers::RocmBlas;
 pub mod utils;
 pub use utils::{Map1, Map1Any, Map2, Map2Any, Map2InPlace, Map3, S};
 
