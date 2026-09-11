@@ -6,10 +6,13 @@
 //! of twenty pointwise ops paid twenty full device synchronisations and the
 //! backend had essentially no CPU/GPU overlap.
 //!
-//! [`RocmAllocator`] fixes that by never handing a buffer back to the driver on
+//! [`RocmAllocator`] fixes that by not handing buffers back to the driver on
 //! the hot path: freed blocks go on a per-size free list and are reused by the
 //! next allocation of that size. Freeing becomes a host-side push and allocating
-//! becomes a host-side pop.
+//! becomes a host-side pop. The cache is bounded — parked bytes above
+//! [`default_cache_limit`] are evicted back to the driver, largest block first —
+//! so a workload whose shapes drift every step (autoregressive decode above
+//! all) cannot hoard the card's VRAM in blocks nothing will request again.
 //!
 //! # Why not `hipMallocAsync`
 //!
@@ -36,6 +39,7 @@
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use rocm_rs::hip::bindings;
@@ -51,23 +55,29 @@ fn hip_check(status: bindings::hipError_t) -> Result<(), HipError> {
     }
 }
 
-/// Allocation granularity below and above [`LARGE_BLOCK`].
+/// Bounds on the allocation granularity.
 ///
 /// Rounding up means two tensors of *similar* size share a bucket instead of
-/// each forcing a fresh `hipMalloc`. 512 B matches the driver's own alignment,
-/// so small buffers waste nothing that was not already padding; 1 MiB on large
-/// ones caps the waste at 0.1% of a 1 GiB block while still collapsing the
-/// near-misses a varying batch size produces.
+/// each forcing a fresh `hipMalloc`. The granularity is *relative* — an eighth
+/// of the request's power-of-two floor — because the workloads that defeat a
+/// fixed granularity are the shape-drifting ones: autoregressive decode grows
+/// its attention buffers by a few KB every step, and with a fixed step a
+/// slightly-larger request lands in a fresh bucket while the previous step's
+/// block is parked forever. An eighth keeps the overshoot at or below 12.5%
+/// and puts every request between consecutive powers of two into one of eight
+/// buckets, so a growing buffer reuses its block for many steps before
+/// stepping up.
+///
+/// 512 B is the floor — the driver's own alignment, so small buffers waste
+/// nothing that was not already padding. 32 MiB is the ceiling, so a
+/// multi-GiB weight tensor overshoots by at most 32 MiB rather than by 12.5%.
 const SMALL_GRANULARITY: usize = 512;
-const LARGE_GRANULARITY: usize = 1 << 20;
-const LARGE_BLOCK: usize = 1 << 20;
+const MAX_GRANULARITY: usize = 32 << 20;
 
 fn bucket_size(size: usize) -> usize {
-    let granularity = if size <= LARGE_BLOCK {
-        SMALL_GRANULARITY
-    } else {
-        LARGE_GRANULARITY
-    };
+    // `size` is never 0 here, but `max(1)` keeps `ilog2` total anyway.
+    let granularity =
+        ((1usize << size.max(1).ilog2()) / 8).clamp(SMALL_GRANULARITY, MAX_GRANULARITY);
     size.div_ceil(granularity) * granularity
 }
 
@@ -84,6 +94,14 @@ struct Block(*mut std::ffi::c_void);
 // the same block as available.
 unsafe impl Send for Block {}
 
+/// The free list plus the running total of the bytes parked on it, kept
+/// together under one lock so the total can never drift from the map.
+#[derive(Default)]
+struct FreeLists {
+    map: HashMap<usize, Vec<Block>>,
+    cached_bytes: usize,
+}
+
 /// Caching device allocator for one [`super::RocmDevice`].
 ///
 /// Holds an `Arc` of the device's stream so that the ordering invariant
@@ -91,7 +109,11 @@ unsafe impl Send for Block {}
 /// every buffer it hands out, keeps that stream alive.
 pub struct RocmAllocator {
     stream: Arc<SendSyncStream>,
-    free: Mutex<HashMap<usize, Vec<Block>>>,
+    free: Mutex<FreeLists>,
+    /// Ceiling on [`FreeLists::cached_bytes`]; parking a block above it evicts
+    /// parked blocks back to the driver, largest first. `usize::MAX` disables
+    /// the cap. Atomic only so tests can tighten it through the `Arc`.
+    cache_limit: AtomicUsize,
 }
 
 // SAFETY: the state is a stream handle — a process-wide driver object with no
@@ -104,7 +126,8 @@ impl RocmAllocator {
     pub(crate) fn new(stream: Arc<SendSyncStream>) -> Self {
         Self {
             stream,
-            free: Mutex::new(HashMap::new()),
+            free: Mutex::new(FreeLists::default()),
+            cache_limit: AtomicUsize::new(default_cache_limit()),
         }
     }
 
@@ -115,7 +138,7 @@ impl RocmAllocator {
     /// Poisoning is ignored: the map is a pure cache, so the worst a panic
     /// mid-update can leave behind is a block that is never reused. Refusing to
     /// allocate afterwards would be strictly worse.
-    fn lock_free(&self) -> MutexGuard<'_, HashMap<usize, Vec<Block>>> {
+    fn lock_free(&self) -> MutexGuard<'_, FreeLists> {
         self.free.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -125,8 +148,12 @@ impl RocmAllocator {
             return Ok((std::ptr::null_mut(), 0));
         }
         let bucket = bucket_size(size);
-        if let Some(block) = self.lock_free().get_mut(&bucket).and_then(Vec::pop) {
-            return Ok((block.0, bucket));
+        {
+            let mut free = self.lock_free();
+            if let Some(block) = free.map.get_mut(&bucket).and_then(Vec::pop) {
+                free.cached_bytes -= bucket;
+                return Ok((block.0, bucket));
+            }
         }
 
         match raw_malloc(bucket) {
@@ -140,12 +167,66 @@ impl RocmAllocator {
         }
     }
 
-    /// Park a block for reuse. Never calls `hipFree`, and so never blocks.
+    /// Park a block for reuse; on the hot path this is a host-side push.
+    ///
+    /// If parking the block lifts the cache past [`Self::cache_limit`], parked
+    /// blocks are returned to the driver, largest bucket first, until the
+    /// cache fits again. The cap is what keeps a shape-drifting workload — a
+    /// decode loop whose buffers grow every step, parking a slightly-too-small
+    /// block each time — from hoarding the whole card: the driver, rocRAND,
+    /// rocBLAS workspaces and every other process allocate outside this free
+    /// list, so `alloc_bytes`' release-and-retry cannot save *them* from an
+    /// OOM this cache caused. Largest-first eviction throws out exactly the
+    /// outgrown blocks while the small, hot buckets survive.
     fn recycle(&self, ptr: *mut std::ffi::c_void, bucket: usize) {
         if ptr.is_null() {
             return;
         }
-        self.lock_free().entry(bucket).or_default().push(Block(ptr));
+        let evicted = {
+            let mut free = self.lock_free();
+            free.map.entry(bucket).or_default().push(Block(ptr));
+            free.cached_bytes += bucket;
+            let mut evicted = Vec::new();
+            let cache_limit = self.cache_limit.load(Ordering::Relaxed);
+            // Every round removes a block or an empty bucket, so this ends.
+            while free.cached_bytes > cache_limit {
+                let Some(&largest) = free.map.keys().max() else {
+                    break;
+                };
+                // `alloc_bytes` pops without pruning, so a bucket can be empty.
+                match free.map.get_mut(&largest).and_then(Vec::pop) {
+                    Some(block) => {
+                        evicted.push(block);
+                        free.cached_bytes -= largest;
+                    }
+                    None => {
+                        free.map.remove(&largest);
+                    }
+                }
+            }
+            evicted
+        };
+        // `hipFree` synchronises the device, so it runs outside the lock; the
+        // sync is also what makes freeing sound while queued work may still
+        // reference the block.
+        for block in evicted {
+            // SAFETY: the block came from `hipMalloc` and is no longer
+            // reachable from the map.
+            unsafe {
+                let _ = bindings::hipFree(block.0);
+            }
+        }
+    }
+
+    /// Bytes currently parked on the free list.
+    #[cfg(test)]
+    pub(crate) fn cached_bytes(&self) -> usize {
+        self.lock_free().cached_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_cache_limit(&self, bytes: usize) {
+        self.cache_limit.store(bytes, Ordering::Relaxed);
     }
 
     /// Return every parked block to the driver.
@@ -155,7 +236,9 @@ impl RocmAllocator {
     /// this runs only when the device is being torn down or an allocation has
     /// already failed.
     fn release_all(&self) {
-        for (_, blocks) in self.lock_free().drain() {
+        let mut free = self.lock_free();
+        free.cached_bytes = 0;
+        for (_, blocks) in free.map.drain() {
             for block in blocks {
                 // SAFETY: every block came from `hipMalloc` and is not
                 // reachable from anywhere else once drained from the map.
@@ -164,6 +247,30 @@ impl RocmAllocator {
                 }
             }
         }
+    }
+}
+
+/// The cap on parked bytes: an eighth of the card's VRAM, overridable with
+/// `CANDLE_ROCM_CACHE_LIMIT_MB` (`0` disables the cap).
+///
+/// An eighth is small enough that the cache never starves the driver or a
+/// neighbouring library of a 16 GB card, and large enough that a shape-stable
+/// workload — whose parked set is only the buffers currently between owners —
+/// never reaches it and keeps the old always-cache behaviour.
+fn default_cache_limit() -> usize {
+    if let Some(mb) = std::env::var("CANDLE_ROCM_CACHE_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return if mb == 0 { usize::MAX } else { mb << 20 };
+    }
+    let (mut free, mut total) = (0usize, 0usize);
+    // SAFETY: both out-pointers are valid; the values are only read on success.
+    let status = unsafe { bindings::hipMemGetInfo(&mut free, &mut total) };
+    if status == bindings::hipError_t_hipSuccess && total > 0 {
+        total / 8
+    } else {
+        1 << 30
     }
 }
 
@@ -346,17 +453,17 @@ impl<T> Drop for SendSyncDeviceMemory<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bucket_size, LARGE_BLOCK, LARGE_GRANULARITY, SMALL_GRANULARITY};
+    use super::{bucket_size, MAX_GRANULARITY, SMALL_GRANULARITY};
 
     #[test]
     fn buckets_round_up_to_the_granularity() {
         assert_eq!(bucket_size(1), SMALL_GRANULARITY);
         assert_eq!(bucket_size(SMALL_GRANULARITY), SMALL_GRANULARITY);
         assert_eq!(bucket_size(SMALL_GRANULARITY + 1), 2 * SMALL_GRANULARITY);
-        assert_eq!(bucket_size(LARGE_BLOCK), LARGE_BLOCK);
-        // Just past the small/large boundary the granularity jumps, so a 1 MiB
-        // + 1 byte request rounds to 2 MiB rather than to 1 MiB + 512 B.
-        assert_eq!(bucket_size(LARGE_BLOCK + 1), 2 * LARGE_GRANULARITY);
+        // At 1 MiB the relative granularity is 128 KiB, so one byte past an
+        // exact bucket steps up by 128 KiB rather than by 512 B.
+        assert_eq!(bucket_size(1 << 20), 1 << 20);
+        assert_eq!(bucket_size((1 << 20) + 1), (1 << 20) + (128 << 10));
     }
 
     /// Two tensors of the same shape must land in the same bucket, or the free
@@ -365,5 +472,31 @@ mod tests {
     fn equal_sizes_share_a_bucket() {
         assert_eq!(bucket_size(4096 * 4), bucket_size(4096 * 4));
         assert_eq!(bucket_size(64 << 20), bucket_size(64 << 20));
+    }
+
+    /// A bucket must hold the request, and the granularity choice bounds the
+    /// overshoot: 12.5% relative in the mid range, 32 MiB absolute on giants.
+    #[test]
+    fn overshoot_is_bounded() {
+        for size in [1usize, 700, 4 << 10, 1 << 20, 70 << 20, 3 << 30] {
+            let bucket = bucket_size(size);
+            assert!(bucket >= size);
+            assert!(bucket - size <= (size / 8).clamp(SMALL_GRANULARITY, MAX_GRANULARITY));
+        }
+    }
+
+    /// Growing a buffer across a whole octave visits only a handful of
+    /// buckets, which is what stops a decode loop — whose attention buffers
+    /// grow by a few KB per generated token — from parking a fresh
+    /// never-reused block every step.
+    #[test]
+    fn an_octave_of_growth_visits_few_buckets() {
+        let mut buckets = std::collections::BTreeSet::new();
+        let mut size = 1usize << 20;
+        while size <= 2 << 20 {
+            buckets.insert(bucket_size(size));
+            size += 4 << 10;
+        }
+        assert!(buckets.len() <= 9, "got {} buckets", buckets.len());
     }
 }

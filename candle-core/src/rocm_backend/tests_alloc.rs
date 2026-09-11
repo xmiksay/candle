@@ -74,3 +74,45 @@ fn an_empty_allocation_is_null_and_is_not_recycled() -> Result<()> {
     assert!(!dev.alloc::<f32>(1)?.as_ptr().is_null());
     Ok(())
 }
+
+/// Parking a block above the cache limit evicts back to the driver, largest
+/// first, so the cache stays bounded while the hot small buckets survive.
+#[test]
+fn the_cache_cap_evicts_largest_first() -> Result<()> {
+    let dev = device!();
+    dev.allocator.set_cache_limit(4 << 20);
+    // Park a small block, then a large one that lifts the cache past the cap:
+    // the large block itself is the eviction victim, the small one survives.
+    let small_ptr = {
+        let small = dev.alloc::<u8>(64 << 10)?;
+        let ptr = small.as_ptr();
+        drop(small);
+        ptr
+    };
+    drop(dev.alloc::<u8>(8 << 20)?);
+    assert!(dev.allocator.cached_bytes() <= 4 << 20);
+    // The small bucket is still parked and still hits.
+    assert_eq!(dev.alloc::<u8>(64 << 10)?.as_ptr(), small_ptr);
+    dev.allocator.set_cache_limit(usize::MAX);
+    Ok(())
+}
+
+/// A decode-style monotonically growing sequence of allocations must reuse
+/// blocks rather than park a fresh one every step: the relative bucket
+/// granularity keeps the number of distinct blocks logarithmic-ish, and the
+/// cap bounds what the misses can accumulate.
+#[test]
+fn growing_allocations_do_not_hoard_unboundedly() -> Result<()> {
+    let dev = device!();
+    dev.allocator.set_cache_limit(64 << 20);
+    // 4 KB of growth per step from 1 MiB, like a lengthening KV sequence.
+    let mut size = 1usize << 20;
+    for _ in 0..2000 {
+        let buf = dev.alloc::<u8>(size)?;
+        drop(buf);
+        size += 4 << 10;
+    }
+    assert!(dev.allocator.cached_bytes() <= 64 << 20);
+    dev.allocator.set_cache_limit(usize::MAX);
+    Ok(())
+}
