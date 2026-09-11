@@ -169,35 +169,6 @@ cache directly. Only `RocmDevice`, `SendSyncDeviceMemory`, `launch_config*` and
 launch; `rocm_backend/tests_custom_kernel.rs` is a worked example that uses
 nothing else.
 
-## `ug` kernels
-
-`UgIOp1` and `RocmDevice::compile` work under `--features "rocm ug"`, riding the
-same custom-module pipeline: the generated HIP text goes to
-`get_or_load_custom_func` under the module name `candle_ug_{func_name}`, so it is
-cached and keyed exactly like any other source.
-
-The code generator is the part with no upstream equivalent. `cuda` and `metal`
-re-export `ug-cuda` and `ug-metal`; there is no `ug-rocm` crate, so
-`candle-ug/src/rocm/code_gen.rs` emits HIP from the same SSA kernel directly, and
-`candle-ug`'s `rocm` feature pulls no extra dependency. Block reductions come
-from `candle-ug/src/rocm/reduce.hip`, appended only when the kernel contains a
-`ReduceLocal`. It uses HIP's unsuffixed `__shfl_xor(x, mask, 32)` rather than the
-`_sync` form for the reason in the shim section — the `_sync` spelling wants a
-64-bit lane mask — with the width given explicitly so the reduction is also
-correct on wave64 CDNA.
-
-Two deliberate differences from `cuda_fwd`. The launch geometry is the one `ug`
-lowered for (`kernel.launch_config()`), not a geometry re-derived from the
-element count: for the `exp` sample `ug` asks for one block of one thread and
-loops serially, where the CUDA rule launches 12 blocks that each redo the whole
-loop and race on one buffer. Shared memory is honoured for the same reason; CUDA
-hardcodes it to zero. Everything else is at parity, including the f32-and-
-contiguous-only restriction the op carries on all three backends.
-
-The one asymmetry that cannot be closed is the toolchain: CUDA compiles through
-nvrtc in-process, while this path shells out to `hipcc`, so it must be on `PATH`
-at *run* time and the first use of a kernel pays a compile.
-
 ## Environment variables
 
 | Variable | Effect |
@@ -207,6 +178,7 @@ at *run* time and the first use of a kernel pays a compile.
 | `CANDLE_ROCM_CACHE_DIR` | Cache root, overriding `~/.cache/candle-rocm` |
 | `CANDLE_ROCM_FORCE_RECOMPILE` | `1` skips the cache read (the write still happens) |
 | `CANDLE_ROCM_FORCE_DMMV` | Disables both `q8_1` quantized paths (MMVQ *and* MMQ); read in `quantized/rocm/q8_1.rs` |
+| `CANDLE_ROCM_CACHE_LIMIT_MB` | Cap in MiB on the allocator's parked free-list bytes; default an eighth of VRAM, `0` removes the cap |
 | `ROCM_PATH` | ROCm install root, default `/opt/rocm` |
 
 Architecture detection fails loudly rather than guessing. A code object built
@@ -269,7 +241,6 @@ the same `candle-kernels` code the CUDA backend launches.
 | `candle-nn`: `softmax_last_dim`, `rms_norm`, `layer_norm`, `sigmoid` | shared kernel | `rocm_fwd` on the custom op; f16/bf16/f32/f64 only |
 | `candle-nn`: `rope`, `rope_i`, `rope_thd` | shared kernel | f16/bf16/f32/f64 only |
 | `candle-nn`: `moe_gemm_gguf` | shared kernel | via `indexed_moe_forward`; see below |
-| `ug` kernels (`UgIOp1`, `RocmDevice::compile`) | generated HIP | `--features "rocm ug"`; see below |
 
 ### dtypes
 
@@ -601,7 +572,6 @@ Everything is driven from the repo-root `Makefile`:
 | `make test-rocm` | `test-rocm-core` then `test-rocm-nn` |
 | `make test-rocm-core` / `-nn` | the GPU suites, filtered by `ROCM_FILTER` |
 | `make test-rocm-suite SUITE=…` | one `candle-core` integration suite |
-| `make test-rocm-ug` | the `ug` micro-kernel path |
 | `make rocm-shim-test` | the shim, on real hardware; see below |
 | `make rocm-cache-clean` | removes the compiled-kernel cache |
 
@@ -612,11 +582,6 @@ path (`quantized::rocm::tests_mmvq::…`) — so `test-rocm-core` was running 5 
 tests and skipping 92. `ROCM_TEST_THREADS` defaults to 1 so that GPU memory use
 and the attribution of a failure stay predictable; the disk cache is locked per
 entry, so concurrency is safe, just noisier.
-
-`test-rocm-ug` is separate because `ug` is not part of the `rocm` feature set —
-`candle-core`'s `rocm` feature carries `candle-ug?/rocm`, which only fires if
-`ug` is *also* enabled — so the suites above never build `UgIOp1`. It filters on
-`ug` rather than `ROCM_FILTER`, the test being named for the op.
 
 ## Testing the shim
 
